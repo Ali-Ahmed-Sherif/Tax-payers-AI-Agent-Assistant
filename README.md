@@ -8,16 +8,10 @@ assessment into a single guided workflow — with every sensitive decision
 enforced by the database itself, not just trusted to whatever a language
 model happens to say.
 
-[![Watch the eTax demo](https://img.youtube.com/vi/u1ywiZGVsxU/hqdefault.jpg)](https://youtu.be/u1ywiZGVsxU)
+[![Watch the eTax demo](docs/assets/demo-thumbnail.png)](https://youtu.be/u1ywiZGVsxU)
 
 **[Watch the 3:35 demo video](https://youtu.be/u1ywiZGVsxU)** — sign-up, face
 verification, fraud-risk assessment, and the chat agent, end to end.
-
-> The thumbnail above is YouTube's own auto-generated frame, not the
-> landing-page screenshot you shared — pasted chat images aren't saved to
-> disk in this environment, so there was no file to embed. Save that
-> screenshot into the repo (for example `docs/assets/landing-page.png`) and
-> it can be wired in as the exact clickable image instead.
 
 ---
 
