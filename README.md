@@ -1,319 +1,198 @@
 # eTax — AI-Assisted Tax Platform
 
-**Phase 1 (done):** Landing → Signup/Login → Face enrollment/verification →
-authenticated Chatbot UI shell.
+*The digital taxation hub.* An end-to-end AI-powered tax platform designed to
+simplify and modernize how taxpayers interact with tax services — secure
+identity, conversational access to authorized records, and fraud-risk
+assessment, all in one workflow.
 
-**Phase 2 (in progress) — chatbot agent.** Six intents total (`greeting`,
-`fraud_assessment`, `database_query`, `other`, `unclear`, `multi_intent` —
-cut down from an earlier 8-intent set after `assistant_identity`/
-`tax_conversation`/`off_topic` proved unreliable to keep separate and were
-collapsed into `other`; see `CLAUDE.md`). `fraud_assessment` and
-`database_query` are fully real end to end (UI included); `greeting`/
-`other`/`unclear`/`multi_intent` answer from curated deterministic templates
-(no LLM call for the reply itself):
-- **fraud_assessment** — every field comes from the user's own linked
-  `tax.fraud_records` row (claimed at signup via a 9-digit code — a third,
-  independent identity mapping, unrelated to company ownership), never
-  typed/pasted into the chat. A LangGraph `interrupt()` shows all 23 values
-  **read-only** plus the record's review status; the user either confirms it
-  (runs the single full XGBoost model on all 23 inputs — the old
-  partial-input dedicated 8-feature model and LLM extraction/validation are
-  gone) or flags specific values as wrong (sets `review_status =
-  "requested_review"`, never edits the value directly — corrections are a
-  tax-authority-side workflow this app only stands a symbol column in for).
-  The result is a plain-language **risk score** (a percentage vs.
-  `FRAUD_THRESHOLD`), never the word "suspicious"/"fraud".
-- **database_query** — ownership-aware: a user with no company shares never
-  reaches the SQL-generating LLM at all. Otherwise the message is translated
-  to an internal English question → the LLM writes a single SQL `SELECT`
-  restricted (by a real SQL parse tree, not a string check) to only the
-  secure view(s) matching that user's per-company majority/minority holdings
-  → executed as an unprivileged Postgres role with row-level security
-  enforced → the LLM phrases a short factual answer in `state["response_language"]`
-  (set once per turn from the user's own message, not re-detected/guessed
-  per response), with the full result set also returned as a real data
-  table. See `CLAUDE.md`'s "Ownership-aware SQL security" for the full design.
-- **greeting / other / unclear / multi_intent** — a deterministic pre-router
-  in `route_intent` catches, in order: an obvious standalone greeting ("Hi",
-  "مرحبا"); a pasted `Field: value` fraud-feature dump; or an explicit
-  fraud-leaning keyword ("سليم"/"فحص"/"check"/"assess" — unless a stronger
-  database-retrieval verb is also present) — routing straight to
-  `fraud_assessment` without ever calling the classifier for these. A
-  greeting attached to a real request ("Hi, show my taxes.") still goes
-  through the classifier. All four reply from curated bilingual template
-  pools (`responses.py`) rather than a response-generation LLM call.
+[![Watch the eTax demo](https://img.youtube.com/vi/u1ywiZGVsxU/hqdefault.jpg)](https://youtu.be/u1ywiZGVsxU)
 
-The chat UI (`/chat`) calls the real backend now — text messages, the fraud
-form (dropdowns/inputs generated from the backend's schema, not
-hand-duplicated), query result tables, a working mic (speech-to-text) and a
-voice-replies toggle (text-to-speech) all work. The controlled SQL subgraph
-(replacing today's minimal version) is not built yet — see `backend/app/chat/`
-for what exists.
+▶️ **[Watch the 3:35 demo video](https://youtu.be/u1ywiZGVsxU)** — sign-up, face
+verification, fraud-risk assessment, and the chat agent, end to end.
 
-## Structure
+---
+
+## The problem
+
+Filing taxes the traditional way is a hassle: long queues → stacks of
+paperwork → hours lost per visit → room for human error. A reliable process
+should leave no room for mistakes — but the manual version rarely does.
+
+## The solution
+
+eTax isn't a chatbot bolted onto a database. It's an **intent router with
+judgment**: it decides what kind of help a request needs first, and only then
+checks who's asking and what they're allowed to see — at every step along the
+way, enforced by the backend and the database, not just the UI.
+
+- 🤖 **AI Tax Agent** — built with **LangGraph** for agent orchestration,
+  routing every message to the right workflow (fraud assessment, authorized
+  data lookup, or a plain answer) and pausing/resuming multi-step flows
+  (e.g. a fraud review interrupted mid-way) without losing state.
+- 🕵️ **Fraud detection ML model** — an XGBoost model trained on real tax
+  data (a meaningfully imbalanced ~10.7% fraud rate) scores every reviewed
+  record. Evaluation is **recall-first**: a fraud case slipping through
+  undetected is treated as worse than an unnecessary manual review.
+- 🔐 **Secure SQL Agent** — the LLM writes SQL, but only against
+  per-company **database views**, behind forced **Row-Level Security**,
+  scoped **grants**, and **query validation** (a real SQL parse tree, not a
+  string check) — so it can generate a query but can never see or return
+  data the requesting user isn't authorized for.
+- 🪪 **Face recognition with anti-spoofing** — ArcFace embeddings for
+  identity, with passive liveness detection so a photo, screen replay, or
+  spoof attempt never reaches the matching step.
+- 🎙️ **Speech-to-text / text-to-speech**, supporting **Egyptian Arabic and
+  English** — including switching languages mid-conversation.
+- 🐳 **FastAPI backend**, fully **containerized with Docker** — the whole
+  stack (Postgres+pgvector, backend, frontend) comes up with one command.
+
+## How it works
 
 ```
-backend/                 FastAPI API — auth, face enrollment/verification, chat agent, PostgreSQL+pgvector
-frontend/                React (Vite) — ported eTax design system + the six product pages
-docs/                    Deep-dive docs: chatbot flow, codebase review, debugging guide
-ml_artifacts/            Source fraud-model artifacts (ML_inputs_details.txt, feature_importance_table.csv,
-                          the original dataset with its Fraud label, retired 8-feature-model files) — the
-                          copies actually used at runtime (3 .joblib files, Fraud-label-dropped dataset CSV)
-                          live in backend/app/chat/fraud/{models,data}/, baked into the backend image
-system_design_UI.zip     Source design system this frontend was built from
-docker-compose.yml       db + backend + frontend
-.env.example             Template for all required API keys/config — copy to .env and fill in
+Sign up (+ a claimed tax record) → face enrollment (liveness-gated)
+   → every login re-verifies your face → chat
+
+Chat message → intent router decides:
+   ├─ fraud assessment  → pulls YOUR linked record → XGBoost scores it → risk %
+   ├─ database query    → LLM writes SQL scoped to companies you actually own
+   │                       → executed under Postgres RLS as an unprivileged role
+   └─ everything else    → answered from curated templates, no LLM guesswork
 ```
 
-## Sign-in flow
+**Where AI ends and code begins** (a deliberate design boundary, not an
+accident):
 
-Password auth and face verification are two independent steps, enforced by
-the backend on every request (not just hidden by frontend routing):
+| The LLM handles | Code + the database decide |
+|---|---|
+| Interpreting a message, classifying intent | User permissions |
+| Extracting values, phrasing an answer | Missing-value / interrupted-workflow handling |
+| Generating scoped SQL | The fraud prediction itself |
+| Summarizing results | What data is actually returned |
 
-```
-POST /auth/signup  → stage=pending_enrollment token
-POST /face/enroll  → stage=authenticated token   (liveness-gated)
-POST /auth/login   → stage=face_required token    (or pending_enrollment if never enrolled)
-POST /face/verify  → stage=authenticated token   (liveness-gated, matched only against the token's own user)
-GET  /auth/me      → requires stage=authenticated
-```
+The LLM never invents a fact: fraud risk always comes from the trained model,
+and database answers are grounded only in rows Postgres actually returned.
 
-Each stage token only unlocks its own next step — a `face_required` token
-cannot call `/face/enroll`, and `/face/verify` never runs a nearest-neighbor
-search across all enrolled users; it fetches the embedding belonging to the
-`sub` user in the token and compares against that one record only.
+For the full technical deep-dive (schemas, the RLS/view security design,
+provider fallback logic, the LangGraph state machine, etc.), see
+**[CLAUDE.md](CLAUDE.md)**.
 
-## Running it
+---
+
+## Try it yourself
+
+### 1. Configure your environment
 
 ```bash
-cp .env.example .env   # then set a real JWT_SECRET_KEY, and for the chatbot:
-                        # COHERE_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, ELEVENLABS_TTS_KEY
+cp .env.example .env
+```
+
+⚠️ **You must create this `.env` file yourself before running anything** — it
+isn't committed (it's git-ignored on purpose, since it holds real secrets).
+Open it and fill in at least:
+
+- `JWT_SECRET_KEY` — any long random string
+- `COHERE_API_KEY`, `GROQ_API_KEY`, `GEMINI_API_KEY` — needed for the chatbot
+  (speech-to-text, LLM calls, text-to-speech). `.env.example` documents how
+  to add extra fallback Gemini keys if you have more than one.
+- `ELEVENLABS_TTS_KEY` — optional (Gemini/edge-tts cover text-to-speech if
+  this is left empty)
+
+### 2. Run it
+
+```bash
 docker compose up --build
 ```
 
 - Frontend: http://localhost:5173
 - Backend / Swagger docs: http://localhost:8000/docs
-- Postgres: localhost:5432
+- pgAdmin: http://localhost:5050 (`admin@etax.com` / `admin123`)
 
-First backend build takes a while — it bakes in both the InsightFace
-(`buffalo_l`) and MiniFASNetV2 liveness models at build time. Camera access
-requires `localhost` or HTTPS in the browser.
+The first build takes a while — it bakes the InsightFace (`buffalo_l`) and
+MiniFASNetV2 liveness models into the backend image.
 
-## Face recognition
+### 3. Try face recognition + the fraud model
 
-`backend/app/face/face_engine.py` (InsightFace/ArcFace `buffalo_l`) and
-`liveness_engine.py` (MiniFASNetV2 passive liveness) are a standalone
-implementation — not a dependency on any external package. Liveness gates
-both enrollment and verification: a spoofed/photo/screen capture never
-reaches the embedding or matching step. This defends against presentation
-attacks (photos, screens, replays) but not deep fakes or more sophisticated
-spoofing — treat it as one layer, not a complete anti-fraud guarantee.
-
-## Chatbot agent
-
-`backend/app/chat/`:
+Every account is linked to one real record from the training dataset via a
+one-time **9-digit claim code**, entered at signup — this is what the fraud
+model actually scores, and it's never typed or pasted into the chat, only
+confirmed. Use this pre-seeded demo code to try it yourself:
 
 ```
-config.py            STT/LLM provider order, models, cooldown — all env-driven
-providers/llm.py      call_llm_text(...) / call_llm_structured(..., response_model=...)
-                      with Groq → Gemini fallback + per-model cooldown on failure
-providers/stt.py      transcribe_audio(...): Groq detects language -> Cohere transcribes with it
-providers/tts.py      synthesize_speech(...) with ElevenLabs → Gemini fallback
-intent.py             7-way intent classifier (structured output) + INTENT_ROUTING table
-state.py              AgentState — the single TypedDict threaded through the graph
-graph.py              LangGraph: route_intent -> branch; fraud_assessment is a real subgraph,
-                      the other six are still placeholders
-routes.py             POST /chat/message — requires stage=authenticated, handles
-                      both starting a run and resuming an interrupted one
-fraud/schema.py       Option lists, field order, FRAUD_THRESHOLD — shared vocabulary for
-                      the DB model, seed loader, and prediction engine (no user-facing
-                      form schema anymore — every value comes from the DB)
-fraud/records.py      get_user_fraud_record/record_to_fields/request_review — reads/
-                      updates a user's linked tax.fraud_records row
-fraud/engine.py       Loads the onehot/ordinal encoders + the single full XGBoost
-                      model and runs a prediction on a complete (always 23-field)
-                      fraud_records row
-fraud/models/         The three .joblib artifacts (source copies in ml_artifacts/ at repo root)
-fraud/data/           fraud_dataset.csv — the training dataset with its Fraud label
-                      column dropped, loaded into tax.fraud_records at seed time
-db/seed.py             ensure_ready() — loads the tax schema's example dataset (3
-                       companies, 5 transactions, 5 items) if empty, idempotent,
-                       called from main.py's startup hook
-db/security.py          get_user_ownership_status(db_conn, user_id) — the only
-                       source of truth for per-company majority/minority access
-db/query_chain.py       The SQLDatabaseChain experiment (ask_database) + a
-                       non-ownership-aware generate_and_run_sql — both kept as
-                       documented, live-tested evidence; NEITHER is used by the
-                       live graph (see the module's own docstring)
-services/sql_runner.py  handle_user_database_query(...) — the ownership-aware
-                       path database_query actually calls; see CLAUDE.md's
-                       "Ownership-aware SQL security"
+Claim code: 309295275
 ```
 
-Tax data lives in the same Postgres database as auth data (`app.config.DATABASE_URL`), under a separate `tax` schema — see "One PostgreSQL database, two schemas" in `CLAUDE.md` for the full table layout (`taxpayers`, `companies`, `company_owners`, `transactions`, `items`). `db/seed.py` loads a small example dataset (Bright Future Academy / GlobalBuild Corp / City Medical Center, with a handful of transactions and items) so `database_query` has real rows to answer against — this is the literal sample data supplied for development, not generated business records; real seed/import data replaces it separately. There is no SQLite anywhere in the app anymore.
+1. Go to **http://localhost:5173 → Create account** — any name, username,
+   email, and password you like — and enter the claim code above as your
+   *tax record code*.
+2. Enroll your face when prompted (needs camera access — browsers only
+   allow this on `localhost` or HTTPS, which is why running it locally on
+   `localhost:5173` just works).
+3. Log back in — you'll be asked to verify your face against that same
+   enrollment before you can chat.
+4. In the chat, ask it to assess your fraud risk. It pulls the real record
+   behind your claim code and runs the trained model live — no fake data.
 
-`POST /chat/message` (Bearer token) either starts a run (`{"message": "..."}`,
-`thread_id` optional — server mints one) or resumes a paused one
-(`{"thread_id": "...", "form_response": {...}}`). A response is either
-`{"reply": "...", "intent": "..."}` or, when the fraud review card is showing,
-`{"awaiting": {"type": "fraud_review", "record_id": ..., "record": {...all 23
-values, read-only...}, "review_status": "..."}}` — resumed with either
-`{"action": "confirm"}` or `{"action": "flag", "fields": [...]}`.
-`thread_id` is prefixed with the owning user's id and checked on every
-resume — one user can't submit into another user's paused conversation.
-The graph uses `langgraph`'s `InMemorySaver` checkpointer, so paused
-conversations don't survive a backend restart — fine for this stage, would
-need a persistent (e.g. Postgres) checkpointer before this goes further.
+A claim code can only be linked to one account. If `309295275` has already
+been claimed by an earlier test run, reseed the database (drop the Docker
+volumes and `docker compose up --build` again) or use a different unclaimed
+code from `tax.fraud_records`.
 
-A `database_query` response also carries `{"table": {"columns": [...], "rows": [[...], ...]}}`
-alongside the natural-language `reply` when the query returned rows — the
-full result set, not just a summary, per the roadmap's "show complete rows
-in a nice format, not just an LLM summary" note.
+### Don't want to run it locally?
 
-Nodes never call Groq/Gemini/the model files directly — everything goes
-through `call_llm_text`/`call_llm_structured`/`fraud/engine.predict` so
-provider priority, fallback, and the feature-encoding pipeline stay in one
-place each.
+The **[demo video](https://youtu.be/u1ywiZGVsxU)** above walks through this
+exact flow — sign-up, face verification, and a live fraud assessment — end
+to end, with nothing to install.
 
-### The SQLDatabaseChain experiment
+If you'd rather poke at the running app without installing Docker on your
+own machine, this should also work in **GitHub Codespaces**: open a
+Codespace on this repo, run the same two commands from step 1–2 inside it,
+then open the forwarded `5173` port. Codespaces serves forwarded ports over
+HTTPS, which satisfies the same camera-access requirement `localhost` does.
+This hasn't been verified against the free-tier machine size — the backend
+image is sizable (it bakes in the face-recognition models), so a larger
+Codespace machine type may be needed.
 
-Tried it as the roadmap asked, live-tested it against the demo DB across
-several question phrasings, and it's not reliable enough to wire into the
-graph with these providers — kept as `db/query_chain.py`'s `ask_database`
-for the record. `database_query` doesn't call `generate_and_run_sql` from
-that module either (also kept only as a reference implementation, and
-deliberately never wired in since it has no per-user authorization at all) —
-it calls `services/sql_runner.py`'s ownership-aware `handle_user_database_query`
-instead (same idea — LLM writes SQL, Python executes it — through `call_llm_text`'s
-chat-style prompting, which has been reliable everywhere else in this
-project). Confirmed failure modes, same query/model, deterministic across
-repeated runs:
-- `SQLDatabaseChain` builds a **completion-style** prompt (`"...Question: \
-  <q>\nSQLQuery:"`) and asks a **chat-tuned** model to continue it. For
-  "How much tax did taxpayer 1002 pay in 2025?" specifically, the model
-  returned a genuinely empty completion, every time.
-- `use_query_checker=True`'s self-correction follow-up call sometimes
-  returned a conversational non-answer ("I'm ready to review the query, but
-  I need the SQL statement first...") instead of corrected SQL, which then
-  failed as SQL itself.
-- `llama-3.3-70b-versatile` additionally wrapped SQL in ```` ```sql ```` fences
-  regardless of an explicit prompt instruction not to; `openai/gpt-oss-20b`
-  didn't.
-- Some questions ("Show me all Cairo taxpayers.") worked fine — this isn't a
-  config mistake, the approach is just inconsistent, which is exactly the
-  concern the roadmap raised about trusting this chain.
+---
 
-(This investigation predates the PostgreSQL unification below — it ran
-against the old SQLite demo DB and its `taxpayers`/`tax_returns` schema,
-which no longer exists. The conclusion about `SQLDatabaseChain`'s
-unreliability doesn't depend on which database backs it, so it's kept as-is;
-`ask_database` itself has been repointed at the current Postgres `tax`
-schema.)
+## Project structure
 
-Manual smoke tests (need real API keys in `.env`, run live provider calls):
-
-```bash
-docker compose exec backend python -m app.chat._manual_test_intent
+```
+backend/                 FastAPI API — auth, face enrollment/verification, chat agent, PostgreSQL+pgvector
+frontend/                React (Vite) — the eTax design system + product pages
+docs/                    Deep-dive docs: chatbot flow, codebase review, debugging guide, presentation script
+ml_artifacts/            Source fraud-model artifacts (dataset, feature importance, encoders) —
+                          the copies actually used at runtime live in backend/app/chat/fraud/{models,data}/
+system_design_UI.zip     Source design system the frontend was ported from
+Presentation.pptx        The slide deck this project was demoed from
+docker-compose.yml       db + backend + frontend + pgAdmin
+.env.example             Template for every required API key/config — copy to .env and fill in
+CLAUDE.md                Full technical architecture reference
 ```
 
-Notable things found while validating this against live providers and the
-real artifacts (see `.env`/`.env.example` for the resulting defaults):
-- Groq's strict `json_schema` mode requires `additionalProperties: false` on
-  every object (`model_config = ConfigDict(extra="forbid")`) **and** every
-  property listed in `required`, even nullable ones — omitting an Optional
-  field from `required` (Pydantic's default for fields with a default value)
-  400s; fixed by rebuilding `required` as every property key before sending.
-- Gemini's `response_schema` (SDK auto-derives from the Pydantic model) can't
-  represent `additionalProperties` and 400s — worked around by using JSON
-  mode with the schema spelled out in the prompt instead, same as the
-  fallback path for Groq models without strict-mode support.
-- `gemini-2.0-flash` is retired; use the `gemini-flash-latest` alias so this
-  doesn't need chasing again on the next model turnover.
-- Cohere Transcribe requires an explicit `language`; a mismatched hint (e.g.
-  `ar` against English audio) produces fluent-looking but wrong text rather
-  than an error — worth keeping in mind when debugging odd transcripts.
-- A Pydantic field named the same as the type alias in its own annotation
-  (`Region: Optional[Region]`) silently resolves to the field, not the
-  alias — every value validated as if the field's type were `None`. Fixed by
-  renaming the alias (`RegionValue`). Worth grep-ing for elsewhere before it
-  recurs — nothing catches this at import time.
-- The `.joblib` encoders were pickled with scikit-learn 1.3.2; a newer
-  installed version (1.7.2) loads them with only a warning, but pinned to
-  1.3.2 anyway to remove that drift risk rather than trust the warning is
-  harmless.
-- Installing `langchain-groq` downgraded `groq` from 1.6.0 to 0.37.1 as a
-  transitive dependency — re-tested the whole existing provider layer
-  (plain text calls and strict `json_schema` structured calls) against the
-  older SDK before trusting it; both still worked unchanged.
-- Asking an LLM to "respond in the same language as the user's message"
-  is not reliable enough on its own — live-tested and caught one run that
-  returned a fluent **Russian** answer to an Arabic question (correct data,
-  wrong language entirely; the same inputs re-run came back correctly in
-  Arabic). Fixed by detecting the language with a cheap Unicode-range check
-  and naming it explicitly in the prompt ("respond in Arabic") instead of
-  asking the model to infer and match it — confirmed reliable across
-  repeated runs afterward.
-- Docker environment variables are fixed at container **creation**, not
-  read live from `.env`/`docker-compose.yml` on every `up` — after editing
-  either, `docker compose up -d <service>` only picks up the change if it
-  actually recreates the container (which it does on most edits, but not a
-  plain `restart`). Caught this via a stale `GEMINI_LLM_MODELS` value
-  surviving a config fix until the container was explicitly recreated.
-- **Cohere Transcribe has no auto-detect mode.** Live-tested by calling its
-  REST endpoint directly (bypassing the SDK's typed wrapper, which forces a
-  `language` argument): omitting `language` 400s ("missing required field
-  'language'"), and `language="auto"` 400s too ("Unsupported language:
-  'auto'. Must be one of ['en','fr','de','es','pt','it','nl','pl','el','ar',
-  'ko','ja','vi','zh']"). A wrong/fixed language hint doesn't error at all —
-  it silently produces fluent-looking wrong text (reproduced again live:
-  English audio transcribed with `language=ar` came back as unrelated
-  Arabic words). Since the platform needs to handle English, Arabic, or a
-  user switching between them, `backend/app/chat/providers/stt.py` now runs
-  Groq Whisper first with `response_format="verbose_json"` (which reliably
-  auto-detects and names the spoken language) purely to pick the language,
-  then calls Cohere with that language for the transcript actually used —
-  falling back to Groq's own transcript if Cohere is unavailable.
-- **MediaRecorder's browser output isn't what Cohere accepts.** Chrome/Edge
-  only offer `audio/webm` recording; Cohere's supported extensions are
-  `flac, mp3, mpeg, mpga, ogg, wav` — confirmed live via a 400 ("unsupported
-  file extension ... got: webm"). Recording straight to webm made the
-  Cohere-first behavior silently no-op every time (always falling to Groq).
-  Fixed by decoding the recording and re-encoding it to WAV client-side
-  (`frontend/src/hooks/useVoiceRecorder.js`) before upload.
-- **The configured ElevenLabs key can't serve TTS as-is** — live-tested:
-  `GET /v1/voices` and `GET /v1/user` both 401 ("missing the permission
-  voices_read/user_read"), and `POST /v1/text-to-speech/{voice_id}` against
-  a stock library voice 402s ("Free users cannot use library voices via the
-  API. Please upgrade your subscription"). ElevenLabs is still tried first
-  (`TTS_PROVIDER_ORDER=elevenlabs,gemini`) per the project's stated
-  preference — it'll start working the moment the account has an eligible
-  voice/plan — but Gemini is what actually serves voice replies today.
-- **Gemini's TTS models return raw 16-bit PCM, not a playable file** —
-  confirmed live (`mime type: audio/L16;codec=pcm;rate=24000` from
-  `gemini-2.5-flash-preview-tts`). `providers/tts.py` wraps the raw bytes in
-  a WAV header (Python's `wave` module) before returning them; both English
-  and Arabic input were tested and produced correct, clearly audible speech
-  without needing a separate language parameter.
+## Security design (at a glance)
 
-## Frontend chat integration
+1. **Secure views** — every query runs against a Postgres view created with
+   `security_invoker = true`, filtered by the session's own
+   `app.current_user_id` — never the raw tables.
+2. **Forced Row-Level Security** on `company_owners`, `transactions`, and
+   `items` — identity is enforced by the database session itself, not by
+   trusting an ID the LLM or the request happened to mention.
+3. **Role segregation** — all LLM-generated SQL executes as `app_agent`, an
+   unprivileged, non-superuser role with no `BYPASSRLS`, tightly scoped
+   `SELECT` grants, and zero access to the authentication schema.
 
-`/chat` (`frontend/src/pages/ChatPage.jsx`) calls `POST /chat/message` for
-real now instead of echoing a placeholder:
+See **[CLAUDE.md](CLAUDE.md)**'s "Ownership-aware SQL security" section for
+the complete design, including the planning/authorization pipeline that runs
+*before* any SQL is ever generated.
 
-- Plain messages render as chat bubbles; a `database_query` response with a
-  `table` payload renders the design system's `DataTable` under the
-  assistant's text summary.
-- A `fraud_assessment` response with `awaiting.type === "fraud_review"` renders
-  `components/chat/FraudForm.jsx` inline in the message list instead of
-  plain text — a read-only display of all 23 values from `awaiting.record`
-  plus `awaiting.review_status`, each value with a checkbox to flag it as
-  wrong. "Show Risk Score" resumes with `{action: "confirm"}`; "Request
-  Review" resumes with `{action: "flag", fields: [...]}` — the frontend never
-  edits a value directly, only flags it.
-- The composer is disabled while the review card is pending or a request is
-  in flight, so a stray message can't be sent mid-review.
+## Documentation
 
-`frontend/Dockerfile`'s `npm run dev` container now also bind-mounts
-`frontend/src`/`public`/`index.html` (matching the backend's existing
-`--reload` setup) so edits take effect via Vite's HMR without a rebuild —
-see the `frontend` service in `docker-compose.yml`.
+- **[CLAUDE.md](CLAUDE.md)** — full architecture reference (schemas, the
+  LangGraph agent, provider fallback, the security pipeline)
+- **[docs/CHATBOT_DETAILED_FLOW.md](docs/CHATBOT_DETAILED_FLOW.md)** — the
+  chatbot's turn-by-turn flow
+- **[docs/CODEBASE_REVIEW.md](docs/CODEBASE_REVIEW.md)** /
+  **[docs/DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)** — codebase walkthrough and
+  troubleshooting notes
+- **[docs/PRESENTATION_SCRIPT.md](docs/PRESENTATION_SCRIPT.md)** /
+  **Presentation.pptx** — the narrated deck this project was demoed from
